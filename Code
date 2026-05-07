@@ -1,0 +1,525 @@
+code for traffic light system
+#include <Wire.h>
+#include "RTClib.h"
+
+RTC_DS3231 rtc;
+
+// =====================
+// PIN TANIMLARI
+// A = Doğu, B = Güney, C = Batı, D = Kuzey
+// =====================
+
+int redPins[4]    = {2, 5, 8, 11};
+int yellowPins[4] = {3, 6, 9, 12};
+int greenPins[4]  = {4, 7, 10, 13};
+
+int irPins[4] = {A0, A1, A2, A3};
+
+char roadNames[4] = {'A', 'B', 'C', 'D'};
+
+// =====================
+// AYARLAR
+// =====================
+
+const unsigned long TIME_PER_CAR = 2000;        // 1 araba = 2 saniye
+const int MAX_CARS_PER_GREEN = 10;              // bir yeşilde max 10 araba
+const unsigned long YELLOW_TIME = 2000;         // sarı süre
+const unsigned long SENSOR_READ_INTERVAL = 30;
+const unsigned long NIGHT_BLINK_INTERVAL = 500;
+const unsigned long CLOCK_PRINT_INTERVAL = 1000;
+
+bool IR_ACTIVE_LOW = true;
+bool USE_NIGHT_MODE = true;
+
+// =====================
+// TUR TABANLI YOĞUNLUK SİSTEMİ
+// =====================
+
+// Bu turda hizmet alacak araç sayıları
+int currentCount[4] = {0, 0, 0, 0};
+
+// Sonraki tura aktarılacak araç sayıları
+int nextCount[4] = {0, 0, 0, 0};
+
+// Bu turda yol yeşil aldı mı?
+bool servedThisRound[4] = {false, false, false, false};
+
+// Sensör önceki durumları
+bool lastIRState[4] = {false, false, false, false};
+
+// Aktif yeşilde kilitlenen araç sayısı
+int activeGreenCars = 0;
+
+// Son hizmet alan yol
+int lastServedRoad = -1;
+
+// =====================
+// DURUM MAKİNESİ
+// =====================
+
+enum State {
+  IDLE,
+  GREEN,
+  YELLOW,
+  NIGHT
+};
+
+State state = IDLE;
+
+int activeRoad = -1;
+
+unsigned long stateStartTime = 0;
+unsigned long lastSensorReadTime = 0;
+unsigned long lastNightBlinkTime = 0;
+unsigned long lastClockPrintTime = 0;
+
+bool nightBlinkState = false;
+bool nightMessagePrinted = false;
+
+char lastNanoCommand = '?';
+
+// =====================
+// SETUP
+// =====================
+
+void setup() {
+  Serial.begin(9600);
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(redPins[i], OUTPUT);
+    pinMode(yellowPins[i], OUTPUT);
+    pinMode(greenPins[i], OUTPUT);
+    pinMode(irPins[i], INPUT_PULLUP);
+  }
+
+  Wire.begin();
+
+  if (!rtc.begin()) {
+    allRed();
+    sendNanoCommand('N');
+    Serial.println("DS3231 bulunamadi!");
+    while (1);
+  }
+
+ 
+  rtc.adjust(DateTime(__DATE__, __TIME__));
+
+  allRed();
+  sendNanoCommand('N');
+
+  Serial.println("Sistem basladi.");
+}
+
+// =====================
+// LOOP
+// =====================
+
+void loop() {
+  printClockEverySecond();
+
+  if (USE_NIGHT_MODE && isNightTime()) {
+    handleNightMode();
+    return;
+  }
+
+  if (state == NIGHT) {
+    exitNightMode();
+  }
+
+  readAllSensorsNonBlocking();
+
+  if (state == IDLE) {
+    handleIdleState();
+  }
+  else if (state == GREEN) {
+    handleGreenState();
+  }
+  else if (state == YELLOW) {
+    handleYellowState();
+  }
+}
+
+// =====================
+// SAAT YAZDIRMA
+// =====================
+
+void printClockEverySecond() {
+  if (millis() - lastClockPrintTime >= CLOCK_PRINT_INTERVAL) {
+    lastClockPrintTime = millis();
+
+    DateTime now = rtc.now();
+
+    Serial.print("Saat: ");
+    printTwoDigits(now.hour());
+    Serial.print(":");
+    printTwoDigits(now.minute());
+    Serial.print(":");
+    printTwoDigits(now.second());
+
+    Serial.print(" | Tarih: ");
+    printTwoDigits(now.day());
+    Serial.print("/");
+    printTwoDigits(now.month());
+    Serial.print("/");
+    Serial.println(now.year());
+  }
+}
+
+void printTwoDigits(int number) {
+  if (number < 10) Serial.print("0");
+  Serial.print(number);
+}
+
+// =====================
+// SENSÖRLERİ SÜREKLİ OKU
+// =====================
+
+void readAllSensorsNonBlocking() {
+  if (millis() - lastSensorReadTime < SENSOR_READ_INTERVAL) {
+    return;
+  }
+
+  lastSensorReadTime = millis();
+
+  for (int i = 0; i < 4; i++) {
+    bool current = readIR(i);
+
+    // Yoktan vara geçiş = yeni araç
+    if (current == true && lastIRState[i] == false) {
+      addCar(i);
+    }
+
+    lastIRState[i] = current;
+  }
+}
+
+bool readIR(int road) {
+  int value = digitalRead(irPins[road]);
+
+  if (IR_ACTIVE_LOW) {
+    return value == LOW;
+  } else {
+    return value == HIGH;
+  }
+}
+
+// =====================
+// ARAÇ EKLEME
+// =====================
+
+void addCar(int road) {
+  // Eğer yol aktif yeşildeyse veya bu turda zaten hizmet aldıysa,
+  // yeni araçlar sonraki tura yazılır.
+  if (road == activeRoad || servedThisRound[road]) {
+    if (nextCount[road] < MAX_CARS_PER_GREEN) {
+      nextCount[road]++;
+    }
+
+    Serial.print("Yeni arac SONRAKI TURA eklendi | Yol: ");
+    Serial.print(roadNames[road]);
+    Serial.print(" | Sonraki tur sayisi: ");
+    Serial.println(nextCount[road]);
+  }
+  else {
+    // Henüz bu turda hizmet almadıysa mevcut tura yazılır.
+    if (currentCount[road] < MAX_CARS_PER_GREEN) {
+      currentCount[road]++;
+    }
+
+    Serial.print("Yeni arac BU TURA eklendi | Yol: ");
+    Serial.print(roadNames[road]);
+    Serial.print(" | Bu tur sayisi: ");
+    Serial.println(currentCount[road]);
+  }
+
+  printCounts();
+}
+
+// =====================
+// IDLE DURUMU
+// =====================
+
+void handleIdleState() {
+  int nextRoad = chooseNextRoad();
+
+  // Bu turda hizmet alacak yol kalmadıysa
+  if (nextRoad == -1) {
+    // Sonraki turda bekleyen araç var mı?
+    if (hasNextRoundCars()) {
+      promoteNextRound();
+      nextRoad = chooseNextRoad();
+    }
+  }
+
+  if (nextRoad == -1) {
+    allRed();
+    sendNanoCommand('N');
+    return;
+  }
+
+  startGreen(nextRoad);
+}
+
+// =====================
+// YOĞUNLUK + ADİL DÖNGÜ SEÇİMİ
+// =====================
+
+int chooseNextRoad() {
+  int selectedRoad = -1;
+  int bestCount = 0;
+
+  // Son hizmet alan yoldan sonraki yoldan başlayarak ara.
+  // Böylece eşitlikte A hep avantajlı olmaz.
+  for (int step = 1; step <= 4; step++) {
+    int i = (lastServedRoad + step) % 4;
+
+    if (servedThisRound[i]) {
+      continue;
+    }
+
+    if (currentCount[i] <= 0) {
+      continue;
+    }
+
+    // Öncelik araç sayısı fazla olan yolda.
+    if (currentCount[i] > bestCount) {
+      bestCount = currentCount[i];
+      selectedRoad = i;
+    }
+  }
+
+  return selectedRoad;
+}
+
+bool hasNextRoundCars() {
+  for (int i = 0; i < 4; i++) {
+    if (nextCount[i] > 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void promoteNextRound() {
+  Serial.println("Yeni tura geciliyor.");
+
+  for (int i = 0; i < 4; i++) {
+    currentCount[i] = nextCount[i];
+    nextCount[i] = 0;
+    servedThisRound[i] = false;
+  }
+
+  printCounts();
+}
+
+// =====================
+// GREEN
+// =====================
+
+void handleGreenState() {
+  unsigned long elapsed = millis() - stateStartTime;
+
+  unsigned long greenDuration = activeGreenCars * TIME_PER_CAR;
+
+  if (greenDuration > MAX_CARS_PER_GREEN * TIME_PER_CAR) {
+    greenDuration = MAX_CARS_PER_GREEN * TIME_PER_CAR;
+  }
+
+  if (elapsed >= greenDuration) {
+    startYellow();
+  }
+}
+
+// =====================
+// YELLOW
+// =====================
+
+void handleYellowState() {
+  if (millis() - stateStartTime >= YELLOW_TIME) {
+    finishRoad();
+  }
+}
+
+// =====================
+// YEŞİL BAŞLAT
+// =====================
+
+void startGreen(int road) {
+  activeRoad = road;
+  state = GREEN;
+  stateStartTime = millis();
+
+  activeGreenCars = currentCount[road];
+
+  if (activeGreenCars < 1) {
+    activeGreenCars = 1;
+  }
+
+  if (activeGreenCars > MAX_CARS_PER_GREEN) {
+    activeGreenCars = MAX_CARS_PER_GREEN;
+  }
+
+  // Bu yol bu turda hizmet aldı.
+  servedThisRound[road] = true;
+
+  // Bu turdaki araçlar tüketildi.
+  currentCount[road] = 0;
+
+  allRed();
+
+  digitalWrite(redPins[road], LOW);
+  digitalWrite(yellowPins[road], LOW);
+  digitalWrite(greenPins[road], HIGH);
+
+  sendNanoCommand('0' + road);
+
+  Serial.print("YESIL YANDI | Yol: ");
+  Serial.print(roadNames[road]);
+  Serial.print(" | Arac sayisi: ");
+  Serial.print(activeGreenCars);
+  Serial.print(" | Sure: ");
+  Serial.print(activeGreenCars * 2);
+  Serial.println(" saniye");
+}
+
+// =====================
+// SARI BAŞLAT
+// =====================
+
+void startYellow() {
+  state = YELLOW;
+  stateStartTime = millis();
+
+  digitalWrite(greenPins[activeRoad], LOW);
+  digitalWrite(yellowPins[activeRoad], HIGH);
+  digitalWrite(redPins[activeRoad], LOW);
+
+  Serial.print("SARI YANDI | Yol: ");
+  Serial.println(roadNames[activeRoad]);
+}
+
+// =====================
+// YOL BİTİR
+// =====================
+
+void finishRoad() {
+  digitalWrite(yellowPins[activeRoad], LOW);
+  digitalWrite(redPins[activeRoad], HIGH);
+
+  Serial.print("KIRMIZIYA DONDU | Yol: ");
+  Serial.println(roadNames[activeRoad]);
+
+  lastServedRoad = activeRoad;
+  activeRoad = -1;
+  activeGreenCars = 0;
+  state = IDLE;
+
+  sendNanoCommand('N');
+}
+
+// =====================
+// GECE MODU
+// =====================
+
+bool isNightTime() {
+  DateTime now = rtc.now();
+  int hourNow = now.hour();
+
+  if (hourNow >= 2 && hourNow < 6) {
+    return true;
+  }
+
+  return false;
+}
+
+void handleNightMode() {
+  state = NIGHT;
+  activeRoad = -1;
+
+  sendNanoCommand('G');
+
+  if (!nightMessagePrinted) {
+    Serial.println("GECE MODU AKTIF");
+    nightMessagePrinted = true;
+  }
+
+  if (millis() - lastNightBlinkTime >= NIGHT_BLINK_INTERVAL) {
+    lastNightBlinkTime = millis();
+    nightBlinkState = !nightBlinkState;
+
+    allOff();
+
+    for (int i = 0; i < 4; i++) {
+      digitalWrite(yellowPins[i], nightBlinkState);
+    }
+  }
+}
+
+void exitNightMode() {
+  state = IDLE;
+  activeRoad = -1;
+  nightMessagePrinted = false;
+
+  allRed();
+  sendNanoCommand('N');
+}
+
+// =====================
+// LED FONKSİYONLARI
+// =====================
+
+void allRed() {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(redPins[i], HIGH);
+    digitalWrite(yellowPins[i], LOW);
+    digitalWrite(greenPins[i], LOW);
+  }
+}
+
+void allOff() {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(redPins[i], LOW);
+    digitalWrite(yellowPins[i], LOW);
+    digitalWrite(greenPins[i], LOW);
+  }
+}
+
+// =====================
+// NANO KOMUT
+// =====================
+
+void sendNanoCommand(char cmd) {
+  if (lastNanoCommand == cmd) {
+    return;
+  }
+
+  Serial.write('@');
+  Serial.write(cmd);
+
+  lastNanoCommand = cmd;
+}
+
+// =====================
+// DEBUG
+// =====================
+
+void printCounts() {
+  Serial.print("Bu tur: ");
+  for (int i = 0; i < 4; i++) {
+    Serial.print(roadNames[i]);
+    Serial.print("=");
+    Serial.print(currentCount[i]);
+    Serial.print(" ");
+  }
+
+  Serial.print(" | Sonraki tur: ");
+  for (int i = 0; i < 4; i++) {
+    Serial.print(roadNames[i]);
+    Serial.print("=");
+    Serial.print(nextCount[i]);
+    Serial.print(" ");
+  }
+
+  Serial.println();
+}
