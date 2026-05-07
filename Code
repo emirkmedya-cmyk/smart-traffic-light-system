@@ -523,3 +523,113 @@ void printCounts() {
 
   Serial.println();
 }
+
+
+
+For nano 
+int pedPins[4] = {2, 3, 4, 5};
+// A yaya = D2
+// B yaya = D3
+// C yaya = D4
+// D yaya = D5
+
+int activeRoad = -1;
+// -1 = tüm yayalar sabit kırmızı
+// 0 = A aktif
+// 1 = B aktif
+// 2 = C aktif
+// 3 = D aktif
+
+bool nightMode = false;
+
+unsigned long lastBlink = 0;
+bool blinkState = false;
+
+bool commandMode = false;
+
+void setup() {
+  Serial.begin(9600);
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(pedPins[i], OUTPUT);
+    digitalWrite(pedPins[i], HIGH);
+  }
+}
+
+void loop() {
+  readCommand();
+  updatePedestrians();
+}
+
+void readCommand() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (c == '@') {
+      commandMode = true;
+      continue;
+    }
+
+    if (commandMode) {
+      if (c >= '0' && c <= '3') {
+        activeRoad = c - '0';
+        nightMode = false;
+      }
+      else if (c == 'N') {
+        activeRoad = -1;
+        nightMode = false;
+      }
+      else if (c == 'G') {
+        activeRoad = -1;
+        nightMode = true;
+      }
+
+      commandMode = false;
+    }
+  }
+}
+
+void updatePedestrians() {
+  if (millis() - lastBlink >= 300) {
+    lastBlink = millis();
+    blinkState = !blinkState;
+  }
+
+  // Gece modu: tüm yaya kırmızıları yanıp söner
+  if (nightMode) {
+    for (int i = 0; i < 4; i++) {
+      digitalWrite(pedPins[i], blinkState);
+    }
+    return;
+  }
+
+  // Aktif yol yoksa tüm yayalar sabit kırmızı
+  if (activeRoad == -1) {
+    for (int i = 0; i < 4; i++) {
+      digitalWrite(pedPins[i], HIGH);
+    }
+    return;
+  }
+
+  // A veya C yeşilse:
+  // A-C yaya sabit kırmızı
+  // B-D yaya yanıp söner
+  if (activeRoad == 0 || activeRoad == 2) {
+    digitalWrite(pedPins[0], HIGH);
+    digitalWrite(pedPins[2], HIGH);
+
+    digitalWrite(pedPins[1], blinkState);
+    digitalWrite(pedPins[3], blinkState);
+  }
+
+  // B veya D yeşilse:
+  // B-D yaya sabit kırmızı
+  // A-C yaya yanıp söner
+  if (activeRoad == 1 || activeRoad == 3) {
+    digitalWrite(pedPins[1], HIGH);
+    digitalWrite(pedPins[3], HIGH);
+
+    digitalWrite(pedPins[0], blinkState);
+    digitalWrite(pedPins[2], blinkState);
+  }
+}
